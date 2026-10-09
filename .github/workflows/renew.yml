@@ -22,7 +22,7 @@ concurrency:
 jobs:
   renew:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -34,10 +34,42 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install playwright
+          pip install playwright pysocks
           playwright install --with-deps chromium
 
+      - name: Setup proxy (sing-box)
+        # setup_proxy.sh 在未配置 NODE_LINK 时自行退出并写入 IS_PROXY=false，
+        # 属正常情况；故此处 continue-on-error —— 代理失败不应中断续期任务。
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+
+      - name: Check proxy status
+        # 仓库是 public，Actions 日志对外可见。节点出口 IP 属凭证级信息
+        # （暴露后可被针对性封禁），因此只打印结论 + 脱敏后的 IP 前缀。
+        run: |
+          if [ "${IS_PROXY:-false}" = "true" ]; then
+            RAW_IP=$(curl -x "$PROXY_SERVER" -s --max-time 15 https://api.ipify.org || echo "")
+            if [ -n "$RAW_IP" ]; then
+              # 注册为掩码，防止后续步骤意外回显完整 IP
+              echo "::add-mask::$RAW_IP"
+              MASKED=$(printf '%s' "$RAW_IP" | awk -F. 'NF==4{print $1".x.x.x"}' )
+              [ -z "$MASKED" ] && MASKED="x.x.x.x"
+              echo "✅ 代理已启用，出口 IP：$MASKED（已脱敏）"
+            else
+              echo "⚠️ 代理已启用但出口 IP 查询失败"
+            fi
+          else
+            echo "ℹ️ 未配置代理，直连模式"
+          fi
+
       - name: Run renew + watchdog
+        # 不要在此重新声明 PROXY_SERVER / IS_PROXY：
+        # setup_proxy.sh 通过 $GITHUB_ENV 写出的变量会自动进入后续步骤的
+        # shell 环境，脚本用 os.getenv 读取即可；若用 ${{ env.X }} 声明，
+        # 该表达式取不到 GITHUB_ENV 的值，会写入空串覆盖继承来的值。
         env:
           NEO_USER: ${{ secrets.NEO_USER }}
           NEO_PASSWORD: ${{ secrets.NEO_PASSWORD }}

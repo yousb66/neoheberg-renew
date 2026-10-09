@@ -3,20 +3,23 @@
 NeoHeberg VPS 自动续期 + 开机守护
 
 每次运行（GitHub Actions 每日一次）：
-  1. 用 cookie 登录面板（30 天有效期）
-  2. cookie 失效 → 无头浏览器自动重新登录并轮换 secret
-  3. 检查到期日，剩余天数 <= RENEW_DAYS 则续期（+31 天）
-  4. 检查容器状态，已停止则开机
-  5. Telegram 通知结果
+  0. 启用固定出口 IP 代理（NODE_LINK，可选；未配置则直连）
+  1. 无头浏览器登录面板（每次重新登录，不持久化 cookie）
+  2. 检查到期日，剩余天数 <= RENEW_DAYS 则续期（+31 天）
+  3. 检查容器状态，已停止则开机
+  4. Telegram 通知结果
 
 环境变量：
-  NEO_COOKIE     面板 Cookie 头（__Host-NH / __Host-NH-Remember）
-  NEO_PASSWORD   面板密码（仅 cookie 失效时用于重新登录）
+  NEO_USER       面板用户名
+  NEO_PASSWORD   面板密码
+  NEO_VMID       实例 ID
+  NODE_LINK      节点分享链接（可选，固定出口 IP 防风控）
+  PROXY_SERVER   本地代理地址（由 setup_proxy.sh 导出，优先于 NODE_LINK 探测）
   TG_BOT_TOKEN   Telegram bot token（可留空则不通知）
   TG_CHAT_ID     Telegram chat id
-  GH_PAT         可选：用于自动更新 NEO_COOKIE secret（需 repo scope）
   RENEW_DAYS     剩余多少天时续期，默认 10
 """
+
 import os
 import re
 import sys
@@ -25,6 +28,7 @@ import time
 import urllib.request
 import urllib.parse
 import urllib.error
+import socks_proxy  # 本地模块：NODE_LINK 代理（可选，未配置则直连）
 
 BASE = "https://dash.neoheberg.fr"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -79,7 +83,8 @@ def request(path, cookie, data=None, ajax=False, timeout=45):
         h["Referer"] = BASE + "/"
     req = urllib.request.Request(BASE + path, data=data, headers=h,
                                  method="POST" if data is not None else "GET")
-    return urllib.request.urlopen(req, timeout=timeout)
+    # 走代理 opener（未启用代理时即默认 opener，行为不变）
+    return socks_proxy.get_opener().open(req, timeout=timeout)
 
 
 def get_html(path, cookie):
@@ -157,16 +162,20 @@ def refresh_cookie():
     cand = {}
     # 优先用系统 Chrome；CI 里可能只有 playwright 自带的 chromium
     launch_errors = []
+    px = socks_proxy.playwright_proxy()
     with sync_playwright() as p:
         browser = None
         for kwargs in ({"channel": "chrome"}, {}):
             try:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=["--disable-blink-features=AutomationControlled",
-                          "--no-sandbox", "--disable-dev-shm-usage"],
-                    **kwargs)
-                log(f"浏览器: {kwargs.get('channel') or 'bundled chromium'}")
+                launch_kw = dict(headless=True,
+                                 args=["--disable-blink-features=AutomationControlled",
+                                       "--no-sandbox", "--disable-dev-shm-usage"],
+                                 **kwargs)
+                if px:
+                    launch_kw["proxy"] = px
+                browser = p.chromium.launch(**launch_kw)
+                log(f"浏览器: {kwargs.get('channel') or 'bundled chromium'}"
+                    f"{'（经代理）' if px else ''}")
                 break
             except Exception as e:
                 launch_errors.append(f"{kwargs.get('channel') or 'chromium'}: "
@@ -250,19 +259,28 @@ def notify(text):
 def selftest():
     """自检：验证无头浏览器能启动并解出 cap-token（不做登录，不动 cookie）"""
     log("── 自检模式：测试无头浏览器 + Cap.js 求解 ──")
+    # 代理与主流程保持一致：先 init，再取 playwright proxy
+    try:
+        socks_proxy.init()
+        log(f"代理: {socks_proxy.describe()}")
+    except Exception as e:
+        log(f"代理初始化异常: {type(e).__name__}: {str(e)[:120]}")
     from playwright.sync_api import sync_playwright
     t0 = time.time()
+    px = socks_proxy.playwright_proxy()
     try:
         with sync_playwright() as p:
             browser = None
             for kwargs in ({"channel": "chrome"}, {}):
                 try:
-                    browser = p.chromium.launch(
-                        headless=True,
-                        args=["--disable-blink-features=AutomationControlled",
-                              "--no-sandbox", "--disable-dev-shm-usage"], **kwargs)
+                    lk = dict(headless=True,
+                              args=["--disable-blink-features=AutomationControlled",
+                                    "--no-sandbox", "--disable-dev-shm-usage"], **kwargs)
+                    if px:
+                        lk["proxy"] = px
+                    browser = p.chromium.launch(**lk)
                     log(f"浏览器启动: {kwargs.get('channel') or 'bundled chromium'} "
-                        f"({time.time()-t0:.1f}s)")
+                        f"({time.time()-t0:.1f}s){'（经代理）' if px else ''}")
                     break
                 except Exception as e:
                     log(f"  {kwargs.get('channel') or 'chromium'} 启动失败: {type(e).__name__}")
@@ -311,6 +329,15 @@ def main():
         return 1
 
     log(f"配置: 账号={mask(USERNAME)} 实例={mask(VMID)} 续期阈值={RENEW_DAYS}天")
+
+    # 0. 启用代理（固定出口 IP，降低风控；未配置则直连）
+    try:
+        socks_proxy.init()
+        log(f"代理: {socks_proxy.describe()}")
+    except Exception as e:
+        log(f"代理初始化异常: {type(e).__name__}: {str(e)[:120]}")
+        notify(f"❌ NeoHeberg: 代理初始化失败 {type(e).__name__}: {str(e)[:150]}")
+        return 1
 
     # 1. 登录（每次运行都用无头浏览器登录，不依赖持久化 cookie）
     cookie = ""
@@ -406,7 +433,8 @@ def main():
         ("失败" in a or "异常" in a) for a in actions) else "⚠️"
     text = (f"{icon} NeoHeberg 每日任务\n{body}\n"
             f"到期: {exp2} (剩 {days2} 天)\n"
-            f"容器: {status}")
+            f"容器: {status}\n"
+            f"代理: {socks_proxy.describe()}")
     if RUN_URL:
         text += f"\n{RUN_URL}"
     notify(text)
