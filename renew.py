@@ -150,17 +150,121 @@ def vps_status(cookie):
 
 
 # ───────────────────────── cookie 刷新 ─────────────────────────
+#
+# ★ 2026-10 站点改版导致登录页 GET 返回【残缺 HTML】（无 </html>、无
+#   <form>/<input>，稳定停在同一长度），表单元素根本不存在 →
+#   page.fill 超时。这是服务端问题，脚本只能重试等它恢复。
+#   同时确认：① 登录是两步流程（identifier → #goToPassword → password）
+#            ② POST /login 需要 csrf_token
+#            ③ /login 有速率限制，连续请求返回 429
+#   因此这里加：重试 + 指数退避 + 429 识别 + CSRF 注入 + 诊断输出。
+
+LOGIN_ATTEMPTS = int(os.environ.get("NEO_LOGIN_ATTEMPTS", "4"))
+LOGIN_BACKOFF = [int(x) for x in
+                 os.environ.get("NEO_LOGIN_BACKOFF", "15,45,120,300").split(",")]
+
+
+def _backoff(attempt):
+    """第 attempt 次失败（1 起）后应等待的秒数"""
+    i = min(attempt - 1, len(LOGIN_BACKOFF) - 1)
+    return LOGIN_BACKOFF[i] if LOGIN_BACKOFF else 30
+
+
+def page_diag(page):
+    """登录失败时抓页面状态，便于判断是站点异常还是选择器问题"""
+    d = {}
+    try:
+        html = page.content()
+        d["url"] = page.url
+        d["title"] = page.title()[:60]
+        d["html_len"] = len(html)
+        d["html_closed"] = "</html>" in html
+        d["has_identifier"] = 'name="identifier"' in html
+        d["has_password"] = 'name="password"' in html
+        d["inputs"] = page.evaluate("() => document.querySelectorAll('input').length")
+        d["cap_widget"] = page.evaluate("() => document.querySelectorAll('cap-widget').length")
+        d["rate_limited"] = "Trop de requ" in html
+    except Exception as e:
+        d["error"] = f"{type(e).__name__}: {str(e)[:80]}"
+    return d
+
+
+def diag_str(d):
+    if not d:
+        return "(无)"
+    if "error" in d and len(d) == 1:
+        return d["error"]
+    parts = [f"{k}={d[k]}" for k in ("url", "html_len", "inputs", "cap_widget",
+                                     "html_closed", "has_identifier") if k in d]
+    return " ".join(parts)
+
+
+def read_csrf(page):
+    """从页面读 csrf_token（隐藏 input / meta / JS 变量都试）"""
+    try:
+        return page.evaluate("""() => {
+            const i = document.querySelector('input[name="csrf_token"]');
+            if (i && i.value) return i.value;
+            const m = document.querySelector('meta[name="csrf-token"]');
+            if (m && m.content) return m.content;
+            if (window.CSRF_TOKEN) return window.CSRF_TOKEN;
+            if (typeof window.CSRF === 'string') return window.CSRF;
+            return '';
+        }""") or ""
+    except Exception:
+        return ""
+
 
 def refresh_cookie():
-    """无头浏览器登录，返回新的 Cookie 头字符串"""
+    """无头浏览器登录，返回新的 Cookie 头字符串（含重试/退避/CSRF）"""
     pw = os.environ.get("NEO_PASSWORD")
     if not pw:
         return None, "缺少 NEO_PASSWORD，无法自动刷新 cookie"
 
-    from playwright.sync_api import sync_playwright
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        return None, f"playwright 不可用: {type(e).__name__}"
 
+    last_msg = "未尝试"
+    last_diag = {}
+
+    for attempt in range(1, LOGIN_ATTEMPTS + 1):
+        if attempt > 1:
+            wait = _backoff(attempt - 1)
+            log(f"  第 {attempt}/{LOGIN_ATTEMPTS} 次登录尝试（等待 {wait}s）…")
+            time.sleep(wait)
+        else:
+            log(f"  第 {attempt}/{LOGIN_ATTEMPTS} 次登录尝试…")
+
+        cand, msg, diag = _login_once(sync_playwright, pw)
+        last_msg, last_diag = msg, diag
+
+        if cand and "__Host-NH-Remember" in cand:
+            if attempt > 1:
+                log(f"  ✅ 第 {attempt} 次尝试成功")
+            hdr = "; ".join(f"{k}={v}" for k, v in cand.items())
+            return hdr, "ok"
+
+        log(f"  ✗ 尝试 {attempt} 失败: {msg}")
+        if diag:
+            log(f"    页面状态: {diag_str(diag)}")
+        # ★ 站点页面残缺 / 表单缺失 → 只能等它恢复，继续重试
+        if diag.get("rate_limited"):
+            log("    站点返回 429（速率限制），拉长退避")
+            time.sleep(30)
+
+    hint = ""
+    if last_diag and not last_diag.get("has_identifier", True):
+        hint = ("（登录页表单缺失 —— 站点 GET /login 返回残缺 HTML，"
+                "非本脚本问题；等站点恢复）")
+    return None, f"{LOGIN_ATTEMPTS} 次尝试均失败，最后错误: {last_msg}{hint}"
+
+
+def _login_once(sync_playwright, pw):
+    """单次登录尝试。返回 (cookie_dict 或 None, 消息, 诊断 dict)"""
     cand = {}
-    # 优先用系统 Chrome；CI 里可能只有 playwright 自带的 chromium
+    diag = {}
     launch_errors = []
     px = socks_proxy.playwright_proxy()
     with sync_playwright() as p:
@@ -182,15 +286,32 @@ def refresh_cookie():
                                      f"{type(e).__name__}")
                 browser = None
         if browser is None:
-            return None, f"浏览器启动失败 ({', '.join(launch_errors)})"
+            return None, f"浏览器启动失败 ({', '.join(launch_errors)})", {}
+
         ctx = browser.new_context(
             user_agent=UA, viewport={"width": 1920, "height": 1080}, locale="fr-FR")
         page = ctx.new_page()
         try:
             page.goto(BASE + "/login", timeout=60000, wait_until="domcontentloaded")
+
+            # ★ 先等表单出现 —— 站点残缺 HTML 时这里就会失败（不再盲填）
+            try:
+                page.wait_for_selector('input[name="identifier"]', timeout=45000)
+            except Exception:
+                diag = page_diag(page)
+                return None, "登录表单未渲染（input[name=identifier] 不存在）", diag
+
             page.fill('input[name="identifier"]', USERNAME)
             page.click("#goToPassword")
             page.wait_for_timeout(1500)
+
+            # 第二步：密码框
+            try:
+                page.wait_for_selector('input[name="password"]', timeout=25000)
+            except Exception:
+                diag = page_diag(page)
+                return None, "第二步密码框未出现（#goToPassword 跳转失败）", diag
+
             page.evaluate("() => { const w=document.getElementById('cap-login'); if (w) w.solve(); }")
 
             token = ""
@@ -202,13 +323,27 @@ def refresh_cookie():
                 if token and len(token) > 20:
                     break
             if not token:
-                return None, "验证码求解超时"
+                diag = page_diag(page)
+                return None, "验证码求解超时（cap-token 未生成）", diag
 
             page.fill('input[name="password"]', pw)
-            page.evaluate("""() => {
+
+            # ★ POST /login 需要 csrf_token；表单里没有就注入
+            csrf = read_csrf(page)
+            if csrf:
+                log(f"  csrf_token: 已取到（{len(csrf)} 字符）")
+            else:
+                log("  csrf_token: 页面未提供（尝试直接提交）")
+            page.evaluate("""(csrf) => {
                 const f = document.querySelector('input[name="password"]').form;
+                if (csrf && !f.querySelector('input[name="csrf_token"]')) {
+                    const h = document.createElement('input');
+                    h.type='hidden'; h.name='csrf_token'; h.value=csrf;
+                    f.appendChild(h);
+                }
                 f.submit();
-            }""")
+            }""", csrf)
+
             try:
                 page.wait_for_url(re.compile(r"dash\.neoheberg\.fr/(\?.*)?$"),
                                   timeout=45000)
@@ -219,13 +354,25 @@ def refresh_cookie():
             for c in ctx.cookies():
                 if c["name"].startswith("__Host-NH"):
                     cand[c["name"]] = c["value"]
+
+            if "__Host-NH-Remember" not in cand:
+                diag = page_diag(page)
+                # 站点是否给了明确的错误提示
+                try:
+                    err = page.evaluate("""() => {
+                        const a = document.querySelector('[role=alert], .alert-card');
+                        return a ? a.innerText.trim().slice(0,160) : '';
+                    }""")
+                    if err:
+                        diag["site_error"] = re.sub(r"\s+", " ", err)
+                except Exception:
+                    pass
+                return None, f"未取得 remember cookie（拿到 {list(cand)}）", diag
         finally:
             browser.close()
 
-    if "__Host-NH-Remember" not in cand:
-        return None, f"登录未取得 remember cookie（拿到 {list(cand)}）"
-    hdr = "; ".join(f"{k}={v}" for k, v in cand.items())
-    return hdr, "ok"
+    return cand, "ok", diag
+
 
 
 def rotate_secret(new_cookie):
@@ -292,9 +439,27 @@ def selftest():
                                       locale="fr-FR")
             page = ctx.new_page()
             page.goto(BASE + "/login", timeout=60000, wait_until="domcontentloaded")
+
+            # ★ 与主流程一致：先等表单渲染，再判断站点是否正常
+            try:
+                page.wait_for_selector('input[name="identifier"]', timeout=45000)
+            except Exception:
+                d = page_diag(page)
+                log(f"❌ 登录表单未渲染 —— {diag_str(d)}")
+                log("   若 html_closed=False / inputs=0：站点 GET /login 返回残缺 HTML（服务端问题）")
+                browser.close()
+                return 1
+
             page.fill('input[name="identifier"]', USERNAME)
             page.click("#goToPassword")
             page.wait_for_timeout(1500)
+            try:
+                page.wait_for_selector('input[name="password"]', timeout=25000)
+            except Exception:
+                log("❌ 第二步密码框未出现（#goToPassword 跳转失败）")
+                browser.close()
+                return 1
+
             page.evaluate("() => { const w=document.getElementById('cap-login'); if (w) w.solve(); }")
             token = ""
             for _ in range(30):
@@ -304,6 +469,8 @@ def selftest():
                     " return e ? e.value : ''; }")
                 if token and len(token) > 20:
                     break
+            csrf = read_csrf(page)
+            log(f"csrf_token: {'取到 ' + str(len(csrf)) + ' 字符' if csrf else '页面未提供'}")
             browser.close()
 
         if token and len(token) > 20:
@@ -354,7 +521,15 @@ def main():
         log("无头浏览器登录…")
         cookie, msg = refresh_cookie()
         if not cookie:
-            notify(f"❌ NeoHeberg 任务失败：登录失败\n原因: {msg}")
+            # 区分「站点异常」与「脚本/凭证问题」，便于判断要不要人工介入
+            if "表单缺失" in msg or "残缺 HTML" in msg:
+                notify(f"⚠️ NeoHeberg 登录失败（站点侧问题）\n"
+                       f"登录页 GET /login 返回残缺 HTML，表单元素不存在。\n"
+                       f"这是 NeoHeberg 服务端 bug，非脚本问题；已重试 "
+                       f"{LOGIN_ATTEMPTS} 次。\n"
+                       f"建议：等站点修复后自动恢复，或手动到面板续期。")
+            else:
+                notify(f"❌ NeoHeberg 任务失败：登录失败\n原因: {msg}")
             log(f"登录失败: {msg}")
             return 1
         log("登录成功")
