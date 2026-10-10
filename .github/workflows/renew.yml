@@ -2,8 +2,11 @@ name: NeoHeberg Renew
 
 on:
   schedule:
-    # 每天 UTC 02:00（北京时间 10:00）
-    - cron: '0 2 * * *'
+    # 每周一 UTC 02:00（北京时间周一 10:00）
+    # 为什么不是每天：续期只在「剩余 <= RENEW_DAYS(14) 天」时触发，
+    # 周频的最坏检测窗口是 7 天，仍有 7 天余量；且每天登录会反复暴露
+    # 同一账号（风控），也白白消耗 Actions 时长。
+    - cron: '0 2 * * 1'
   workflow_dispatch:
     inputs:
       mode:
